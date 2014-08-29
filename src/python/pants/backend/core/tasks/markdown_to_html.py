@@ -112,8 +112,10 @@ class MarkdownToHtml(Task):
   def execute(self):
     # TODO(John Sirois): consider adding change detection
 
-    css_relpath = os.path.join('css', 'codehighlight.css')
-    css = emit_codehighlight_css(os.path.join(self.workdir, css_relpath), self.code_style)
+    outdir = os.path.join(self.context.config.getdefault('pants_distdir'),
+                          'markdown')
+    css_path = os.path.join(outdir, 'css', 'codehighlight.css')
+    css = emit_codehighlight_css(css_path, self.code_style)
     if css:
       self.context.log.info('Emitted %s' % css)
 
@@ -158,11 +160,10 @@ class MarkdownToHtml(Task):
           src_dir = os.path.dirname(page_to_html_path(page))
           return linked_page.name, os.path.relpath(dest, src_dir)
 
-        page_path = os.path.join(self.context.config.getdefault('pants_distdir'),
-                                 'markdown')
+        page_path = os.path.join(outdir, 'html')
         html = process_page(page, page_path, url_builder, lambda p: None, plaingenmap)
         if css and not self.fragment:
-          plaingenmap.add(page, self.workdir, list(css_relpath))
+          plaingenmap.add(page, self.workdir, list(css_path))
         if self.open and page in roots:
           show.append(html)
 
