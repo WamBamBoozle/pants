@@ -62,7 +62,7 @@ class WikilinksExtension(markdown.Extension):
 
 
 def page_to_html_path(page):
-  "Given a page target id, partial path for an output .html"
+  "Given a page target, return partial path for an output .html"
   source_path = page.sources_relative_to_buildroot()[0]
   return os.path.splitext(source_path)[0] + ".html"
 
