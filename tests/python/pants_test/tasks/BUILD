@@ -71,6 +71,7 @@ python_test_suite(
     ':jar_publish_integration',
     ':jvm_bundle_integration',
     ':jvm_run_integration',
+    ':markdown_to_html_integration',
     ':scala_repl_integration',
     ':protobuf_integration',
   ],
