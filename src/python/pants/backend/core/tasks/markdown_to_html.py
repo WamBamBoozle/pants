@@ -168,7 +168,6 @@ class IncludeExcerptExtension(markdown.Extension):
                           '_begin')
 
 
-
 def page_to_html_path(page):
   "Given a page target, return partial path for an output .html"
   source_path = page.sources_relative_to_buildroot()[0]
