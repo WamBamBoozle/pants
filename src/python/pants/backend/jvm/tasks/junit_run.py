@@ -10,6 +10,7 @@ from collections import defaultdict, namedtuple
 import fnmatch
 import os
 import sys
+import re
 
 from twitter.common.collections import OrderedSet
 from twitter.common.contextutil import temporary_file
@@ -23,8 +24,7 @@ from pants.base.build_environment import get_buildroot
 from pants.base.exceptions import TaskError
 from pants.base.workunit import WorkUnit
 from pants.java.util import execute_java
-from pants.util.dirutil import safe_mkdir, safe_open
-
+from pants.util.dirutil import safe_mkdir, safe_open, touch
 
 
 # TODO(ji): Add unit tests.
@@ -173,15 +173,16 @@ class _JUnitRunner(object):
       self._context.lock.release()
       self.instrument(targets, tests, junit_classpath)
 
-      def report():
-        self.report(targets, tests, junit_classpath)
+      def report(exception=None):
+        self.report(targets, tests, tests_failed_exception=exception)
       try:
-        self.run(targets, tests, junit_classpath)
-      except TaskError:
-        report()
+        # filter out non-junit-test targets
+        self.run(list(self._test_target_candidates(targets)), tests, junit_classpath)
+      except TaskError as e:
+        report(exception=e)
         raise
       else:
-        report()
+        report(exception=None)
 
   def instrument(self, targets, tests, junit_classpath):
     """Called from coverage classes. Run any code instrumentation needed.
@@ -197,7 +198,7 @@ class _JUnitRunner(object):
 
     self._run_tests(tests, junit_classpath, JUnitRun._MAIN, jvm_args=None)
 
-  def report(self, targets, tests, junit_classpath):
+  def report(self, targets, tests, tests_failed_exception):
     """Post-processing of any test output.
 
     Subclasses should override this if they need anything done here."""
@@ -322,6 +323,14 @@ class _Coverage(_JUnitRunner):
                             help='[%%default] Tries to open the generated html coverage report, '
                                    'implies %s.' % coverage_html_flag)
 
+    option_group.add_option(mkflag('coverage-report-when-tests-fail'),
+                            mkflag('coverage-report-when-tests-fail', negate=True),
+                            dest='junit_run_report_when_tests_fail',
+                            action='callback', callback=mkflag.set_bool, default=False,
+                            help='[%%default] Attempt to run the reporting phase of coverage even '
+                                 'if tests failed (defaults to %%default since this would usually '
+                                 'produce unreliable coverage results.')
+
   def __init__(self, task_exports, context):
     super(_Coverage, self).__init__(task_exports, context)
     self._coverage = context.options.junit_run_coverage
@@ -342,6 +351,7 @@ class _Coverage(_JUnitRunner):
     self._coverage_report_html = (self._coverage_report_html_open or
                                   context.options.junit_run_coverage_html)
     self._coverage_html_file = os.path.join(self._coverage_dir, 'html', 'index.html')
+    self._coverage_report_when_tests_fail = context.options.junit_run_report_when_tests_fail
 
   @abstractmethod
   def instrument(self, targets, tests, junit_classpath):
@@ -352,7 +362,7 @@ class _Coverage(_JUnitRunner):
     pass
 
   @abstractmethod
-  def report(self, targets, tests, junit_classpath):
+  def report(self, targets, tests, tests_failed_exception):
     pass
 
   # Utility methods, called from subclasses
@@ -416,7 +426,10 @@ class Emma(_Coverage):
                     JUnitRun._MAIN,
                     jvm_args=['-Demma.coverage.out.file=%s' % self._coverage_file])
 
-  def report(self, targets, tests, junit_classpath):
+  def report(self, targets, tests, tests_failed_exception=None):
+    if tests_failed_exception and not self._coverage_report_when_tests_fail:
+      return
+    self._context.log.warn('Generating report even though tests failed.')
     args = [
       'report',
       '-in', self._coverage_metadata_file,
@@ -464,11 +477,23 @@ class Cobertura(_Coverage):
 
   def __init__(self, task_exports, context):
     super(Cobertura, self).__init__(task_exports, context)
-    self._cobertura_bootstrap_key = 'cobertura'
+    self._cobertura_instrument_bootstrap_key = 'cobertura-instrument'
+    self._cobertura_run_bootstrap_key = 'cobertura-run'
+    self._cobertura_report_bootstrap_key = 'cobertura-report'
     self._coverage_datafile = os.path.join(self._coverage_dir, 'cobertura.ser')
-    task_exports.register_jvm_tool(self._cobertura_bootstrap_key,
-                                   context.config.getlist('junit-run', 'cobertura-bootstrap-tools',
-                                                          default=[':cobertura']))
+    touch(self._coverage_datafile)
+    task_exports.register_jvm_tool(self._cobertura_instrument_bootstrap_key,
+                                   context.config.getlist('junit-run',
+                                                          'cobertura-instrument-bootstrap-tools',
+                                                          default=[':cobertura-instrument']))
+    task_exports.register_jvm_tool(self._cobertura_run_bootstrap_key,
+                                   context.config.getlist('junit-run',
+                                                          'cobertura-run-bootstrap-tools',
+                                                          default=[':cobertura-run']))
+    task_exports.register_jvm_tool(self._cobertura_report_bootstrap_key,
+                                   context.config.getlist('junit-run',
+                                                          'cobertura-report-bootstrap-tools',
+                                                          default=[':cobertura-report']))
     self._rootdirs = defaultdict(OrderedSet)
     self._include_filters = []
     self._exclude_filters = []
@@ -477,9 +502,10 @@ class Cobertura(_Coverage):
         self._exclude_filters.append(filt[1:])
       else:
         self._include_filters.append(filt)
+    self._nothing_to_instrument = True
 
   def instrument(self, targets, tests, junit_classpath):
-    self._cobertura_classpath = self._task_exports.tool_classpath(self._cobertura_bootstrap_key)
+    cobertura_cp = self._task_exports.tool_classpath(self._cobertura_instrument_bootstrap_key)
     safe_delete(self._coverage_datafile)
     classes_by_target = self._context.products.get_data('classes_by_target')
     for target in targets:
@@ -509,6 +535,7 @@ class Cobertura(_Coverage):
     for basedir, classes in self._rootdirs.items():
       if not classes:
         continue  # No point in running instrumentation if there is nothing to instrument!
+      self._nothing_to_instrument = False
       args = [
         '--basedir',
         basedir,
@@ -517,21 +544,35 @@ class Cobertura(_Coverage):
         ]
       with temporary_file() as fd:
         fd.write('\n'.join(classes) + '\n')
-        args.append('--listOfFilesToInstrument')
-        args.append(fd.name)
-        main = 'net.sourceforge.cobertura.instrument.InstrumentMain'
-        result = execute_java(classpath=self._cobertura_classpath + junit_classpath,
-                              main=main,
-                              args=args,
-                              workunit_factory=self._context.new_workunit,
-                              workunit_name='cobertura-instrument')
+      self._instrumented_classes_file = fd.name
+      self._context.log.debug('instrumented classes in %s' % fd.name)
+      args.append('--listOfFilesToInstrument')
+      args.append(fd.name)
+      main = 'net.sourceforge.cobertura.instrument.InstrumentMain'
+
+      # Stalls if this other asm.jar is included
+
+      pattern = re.compile(".*/asm[^/]*\.jar$")
+      clean_junit_cp = [x for x in junit_classpath if not pattern.match(x)]
+      cp = cobertura_cp + clean_junit_cp
+
+      result = execute_java(classpath=cp,
+                            main=main,
+                            # jvm_options=['-Xdebug','-Xrunjdwp:transport=dt_socket,server=y,suspend=y,address=5005'],
+                            args=args,
+                            workunit_factory=self._context.new_workunit,
+                            workunit_name='cobertura-instrument')
       if result != 0:
         raise TaskError("java %s ... exited non-zero (%i)"
                         " 'failed to instrument'" % (main, result))
 
   def run(self, targets, tests, junit_classpath):
+    if self._nothing_to_instrument:
+      self._context.log.warn('Nothing found to instrument, skipping tests...')
+      return
+    cobertura_cp = self._task_exports.tool_classpath(self._cobertura_run_bootstrap_key)
     self._run_tests(tests,
-                    self._cobertura_classpath + junit_classpath,
+                    cobertura_cp + junit_classpath,
                     JUnitRun._MAIN,
                     jvm_args=['-Dnet.sourceforge.cobertura.datafile=' + self._coverage_datafile])
 
@@ -553,7 +594,17 @@ class Cobertura(_Coverage):
               source_by_class[product] = source_file
     return source_by_class
 
-  def report(self, targets, tests, junit_classpath):
+  def report(self, targets, tests, tests_failed_exception=None):
+    if self._nothing_to_instrument:
+      self._context.log.warn('Nothing found to instrument, skipping report...')
+      return
+    if tests_failed_exception:
+      self._context.log.warn('Test failed: %s' % str(tests_failed_exception))
+      if self._coverage_report_when_tests_fail:
+        self._context.log.warn('Generating report even though tests failed%')
+      else:
+        return
+    cobertura_cp = self._task_exports.tool_classpath(self._cobertura_report_bootstrap_key)
     # Link files in the real source tree to files named using the classname.
     # Do not include class file names containing '$', as these will always have
     # a corresponding $-less class file, and they all point back to the same
@@ -612,7 +663,7 @@ class Cobertura(_Coverage):
         report_format,
         ]
       main = 'net.sourceforge.cobertura.reporting.ReportMain'
-      result = execute_java(classpath=self._cobertura_classpath,
+      result = execute_java(classpath=cobertura_cp,
                             main=main,
                             args=args,
                             workunit_factory=self._context.new_workunit,
